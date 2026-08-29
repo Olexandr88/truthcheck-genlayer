@@ -1,37 +1,43 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 from genlayer import *
+from dataclasses import dataclass
 
-import json
 import typing
 
 
 @allow_storage
+@dataclass
 class Claim:
     text: str
     source_url: str
     criteria: str
-    status: str      # "pending" | "true" | "false" | "undetermined"
+    status: str          # "pending" -> "resolved" -> "finalized" | "disputed"
+    verdict: str          # "" | "true" | "false" | "undetermined"
     reasoning: str
-    challenges: u32   # how many times this claim was re-resolved
+    resolutions: u32       # how many times resolve() has run for this claim
+    confirmations: u32     # consecutive matching resolutions in a row
 
 
 class ClaimAdjudicator(gl.Contract):
     """
-    A multi-claim adjudication oracle.
+    A reusable claim-adjudication registry with an explicit lifecycle:
 
-    Unlike a single-shot demo contract, this one manages a registry of
-    independent claims (each with its own evidence source and resolution
-    criteria), supports re-resolution when a result is disputed, and uses
-    a custom equivalence function: validators must agree on the verdict
-    field exactly, but reasoning text is allowed to differ in wording as
-    long as it is non-empty. This mirrors how real adjudication needs to
-    work — the *decision* must reach consensus, the *explanation* doesn't
-    need to be character-identical across LLM runs.
+        pending --resolve()--> resolved --resolve() again, same verdict--> finalized
+                                   |
+                                   `--resolve() again, different verdict--> disputed (resolutions reset the streak)
 
-    Real use case: a prediction market, bounty platform, or insurance
-    dApp registers claims here and reads back structured verdicts, instead
-    of every application reimplementing its own oracle logic from scratch.
+    This models real dispute resolution: a single AI read of the evidence
+    is provisional ("resolved"), not authoritative. A claim only becomes
+    "finalized" once two independent resolutions in a row agree on the
+    same verdict — protecting against a single noisy/adversarial run
+    while still using GenLayer's own validator consensus (not a second
+    off-chain check) to produce each individual resolution.
+
+    Equivalence is custom, not strict_eq: validators must agree on the
+    `verdict` field exactly; `reasoning` only needs to be non-empty, since
+    natural-language phrasing legitimately varies between honest LLM runs
+    reading the same evidence.
     """
 
     claims: TreeMap[u32, Claim]
@@ -42,17 +48,17 @@ class ClaimAdjudicator(gl.Contract):
 
     @gl.public.write
     def submit_claim(self, text: str, source_url: str, criteria: str) -> u32:
-        """
-        Registers a new claim to be adjudicated later. Returns its id.
-        """
+        """Registers a new claim in the "pending" state. Returns its id."""
         claim_id = self.next_id
         self.claims[claim_id] = Claim(
             text=text,
             source_url=source_url,
             criteria=criteria,
             status="pending",
+            verdict="",
             reasoning="",
-            challenges=u32(0),
+            resolutions=u32(0),
+            confirmations=u32(0),
         )
         self.next_id = u32(self.next_id + 1)
         return claim_id
@@ -60,13 +66,20 @@ class ClaimAdjudicator(gl.Contract):
     @gl.public.write
     def resolve(self, claim_id: u32) -> typing.Any:
         """
-        Fetches evidence for the given claim and reaches validator
-        consensus on the verdict using a custom equivalence check:
-        the leader proposes {verdict, reasoning}; each validator
-        independently re-runs the same prompt and accepts the leader's
-        result only if their own verdict matches exactly. Reasoning is
-        checked only for presence, not exact wording, since natural
-        language explanations legitimately vary between LLM runs.
+        Runs one round of the adjudication lifecycle for a claim:
+
+        1. The leader fetches the claim's evidence URL and asks the LLM
+           for a structured verdict.
+        2. Each validator independently repeats step 1 and accepts the
+           leader's output only if their own verdict matches exactly
+           (custom equivalence — see class docstring).
+        3. The claim's state machine advances:
+           - "pending"  -> "resolved"   (first resolution, provisional)
+           - "resolved"/"disputed", same verdict as last time
+                        -> confirmations += 1; "finalized" once
+                           confirmations reaches 2
+           - "resolved"/"finalized", different verdict this time
+                        -> "disputed"; confirmations resets to 1
         """
         if claim_id not in self.claims:
             raise gl.vm.UserError("Unknown claim id")
@@ -95,13 +108,7 @@ No markdown, no extra text — the response must be parsable as JSON."""
             response = gl.nondet.web.get(source_url)
             web_data = response.body.decode("utf-8")
             full_prompt = prompt + f"\n\nEVIDENCE:\n{web_data}"
-            raw = (
-                gl.nondet.exec_prompt(full_prompt)
-                .replace("```json", "")
-                .replace("```", "")
-                .strip()
-            )
-            return json.loads(raw)
+            return gl.nondet.exec_prompt(full_prompt, response_format="json")
 
         def validator_fn(leaders_res) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
@@ -111,18 +118,42 @@ No markdown, no extra text — the response must be parsable as JSON."""
                 return False
             if not leader_out["reasoning"]:
                 return False
+            if leader_out["verdict"] not in ("true", "false", "undetermined"):
+                return False
+
             my_result = leader_fn()
+            if my_result.get("verdict") not in ("true", "false", "undetermined"):
+                return False
+
             return my_result["verdict"] == leader_out["verdict"]
 
         result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+        new_verdict = result["verdict"]
 
-        claim.status = result["verdict"]
+        previous_verdict = claim.verdict
+        claim.resolutions = u32(claim.resolutions + 1)
+
+        if claim.status == "pending":
+            claim.status = "resolved"
+            claim.confirmations = u32(1)
+        elif new_verdict == previous_verdict:
+            claim.confirmations = u32(claim.confirmations + 1)
+            claim.status = "finalized" if claim.confirmations >= u32(2) else "resolved"
+        else:
+            claim.status = "disputed"
+            claim.confirmations = u32(1)
+
+        claim.verdict = new_verdict
         claim.reasoning = result["reasoning"]
-        if claim.status == "undetermined":
-            claim.challenges = u32(claim.challenges + 1)
         self.claims[claim_id] = claim
 
-        return {"claim_id": claim_id, "verdict": claim.status, "reasoning": claim.reasoning}
+        return {
+            "claim_id": claim_id,
+            "status": claim.status,
+            "verdict": claim.verdict,
+            "reasoning": claim.reasoning,
+            "confirmations": claim.confirmations,
+        }
 
     @gl.public.view
     def get_claim(self, claim_id: u32) -> typing.Any:
@@ -132,9 +163,12 @@ No markdown, no extra text — the response must be parsable as JSON."""
         return {
             "text": c.text,
             "source_url": c.source_url,
+            "criteria": c.criteria,
             "status": c.status,
+            "verdict": c.verdict,
             "reasoning": c.reasoning,
-            "challenges": c.challenges,
+            "resolutions": c.resolutions,
+            "confirmations": c.confirmations,
         }
 
     @gl.public.view
